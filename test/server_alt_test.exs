@@ -64,4 +64,23 @@ defmodule Sqlitex.ServerAltTest do
     assert {:ok, %{columns: [:id], rows: [[2]], types: [:integer]}} ===
              Server.query_rows(server, :get_foo, bind: [2])
   end
+
+  test "transaction with commit" do
+    {:ok, server} = Server.start_link(:memory)
+    assert :ok === Server.exec(server, "create table foo(id integer)")
+    assert :ok === Server.add_statement(server, :ids_sorted, "select id from foo order by id")
+
+    all_ids = fn handle ->
+      {:ok, %{rows: rows}} = Server.query_rows(handle, :ids_sorted)
+      :lists.flatten(rows)
+    end
+
+    assert [] === all_ids.(server)
+  end
+
+  defp rcv(val) do
+    receive do
+      ^val -> val
+    end
+  end
 end
