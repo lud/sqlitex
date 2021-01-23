@@ -76,11 +76,72 @@ defmodule Sqlitex.ServerAltTest do
     end
 
     assert [] === all_ids.(server)
+
+    return_val =
+      Server.transaction(server, fn trans ->
+        Server.exec!(trans, "insert into foo (id) values (42)")
+        # changes are visible inside the transaction
+        assert [42] === all_ids.(trans)
+
+        "return-val"
+      end)
+
+    assert return_val === "return-val"
+
+    # changes are visible after the transaction
+    assert [42] === all_ids.(server)
   end
 
-  defp rcv(val) do
-    receive do
-      ^val -> val
+  test "transaction with rollback" do
+    {:ok, server} = Server.start_link(:memory)
+    assert :ok === Server.exec(server, "create table foo(id integer)")
+    assert :ok === Server.add_statement(server, :ids_sorted, "select id from foo order by id")
+
+    all_ids = fn handle ->
+      {:ok, %{rows: rows}} = Server.query_rows(handle, :ids_sorted)
+      :lists.flatten(rows)
     end
+
+    assert [] === all_ids.(server)
+
+    return_val =
+      try do
+        Server.transaction(server, fn trans ->
+          Server.exec!(trans, "insert into foo (id) values (42)")
+          # changes are visible inside the transaction, before rollback
+          assert [42] === all_ids.(trans)
+
+          throw(:fail)
+        end)
+      catch
+        :throw, :fail -> :failed
+      end
+
+    assert return_val === :failed
+
+    # changes were rolled back
+    assert [] === all_ids.(server)
+  end
+
+  test "calling the server in a transaction is forbidden" do
+    {:ok, server} = Server.start_link(:memory)
+    assert :ok === Server.exec(server, "create table foo(id integer)")
+
+    Server.transaction(server, fn trans ->
+      # calling the server inside the transaction
+      assert {:error, :bad_context} = Server.exec(server, "select * from foo")
+      # nested transaction on the server
+      assert {:error, :bad_context} = Server.transaction(server, "select * from foo")
+      # nested transaction on the transaction
+      try do
+        Server.transaction(trans, "select * from foo")
+        flunk("nested transaction was accepted")
+      rescue
+        e in ArgumentError -> assert true
+      end
+    end)
+
+    # After the transaction, the process flag is cleaned up
+    assert {:ok, _} = Server.query(server, "select * from foo")
   end
 end

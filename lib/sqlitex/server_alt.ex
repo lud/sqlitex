@@ -13,13 +13,18 @@ defmodule Sqlitex.ServerAlt do
     defstruct db: nil, stmap: %{}, config: []
   end
 
-  @opaque context :: %Transaction{} | %State{}
-  @type server :: GenServer.server() | context()
+  @trans_flag {__MODULE__, :in_transaction}
+
+  @opaque local :: %Transaction{} | %State{}
+  @type server :: GenServer.server()
+  @type context :: local() | server()
   @type sql :: binary()
   @type statement_name :: atom()
   @type query :: sql() | statement_name()
   @type bindings :: list()
   @type row_type :: :raw_list | Collectable.t()
+  @type transaction_fun :: (local -> any)
+
   @type command ::
           {:exec, query()}
           | {:query, query(), bindings}
@@ -27,6 +32,7 @@ defmodule Sqlitex.ServerAlt do
           | {:add_statement, statement_name(), sql()}
           | :add_meta
           | {:fetch_all, row_type()}
+          | {:transaction, transaction_fun()}
   @type options :: [option]
   @type option ::
           Query.query_option()
@@ -49,20 +55,30 @@ defmodule Sqlitex.ServerAlt do
     GenServer.start_link(__MODULE__, {db_path, config}, opts)
   end
 
-  def exec(server, sql, opts \\ []) do
-    call(server, {:exec, sql}, opts)
+  @spec exec(context, sql, options) :: :ok | {:error, term}
+  def exec(context, sql, opts \\ []) do
+    call(context, {:exec, sql}, opts)
   end
 
-  def query(server, query, opts \\ [])
-
-  def query(server, query, opts) when is_binary(query) when is_atom(query) do
-    call(server, {:query, query, get_bindings(opts)}, opts)
+  @spec exec!(context, sql, options) :: :ok
+  def exec!(context, sql, opts \\ []) do
+    raise_error(exec(context, sql, opts))
   end
 
-  def query_rows(server, query, opts \\ [])
+  def query(context, query, opts \\ []) when is_binary(query) when is_atom(query) do
+    call(context, {:query, query, get_bindings(opts)}, opts)
+  end
 
-  def query_rows(server, query, opts) when is_binary(query) when is_atom(query) do
-    call(server, {:query_rows, query, get_bindings(opts)}, opts)
+  def query!(context, query, opts \\ []) when is_binary(query) when is_atom(query) do
+    raise_error(query(context, query, opts))
+  end
+
+  def query_rows(context, query, opts \\ []) when is_binary(query) when is_atom(query) do
+    call(context, {:query_rows, query, get_bindings(opts)}, opts)
+  end
+
+  def query_rows!(context, query, opts) when is_binary(query) when is_atom(query) do
+    raise_error(query_rows!(context, query, opts))
   end
 
   defp get_bindings(opts) do
@@ -70,7 +86,53 @@ defmodule Sqlitex.ServerAlt do
   end
 
   def add_statement(server, key, sql, opts \\ []) when is_atom(key) and is_binary(sql) do
-    GenServer.call(server, {:add_statement, key, sql, opts}, Config.call_timeout(opts))
+    protected_gen_call(server, {:add_statement, key, sql, opts}, Config.call_timeout(opts))
+  end
+
+  @spec with_transaction(server, transaction_fun(), options()) :: any
+  def with_transaction(server, fun, opts \\ []) do
+    transaction(server, fun, opts)
+  end
+
+  @spec transaction(server, transaction_fun(), options()) :: any
+  def transaction(server, fun, opts \\ [])
+
+  def transaction(%Transaction{}, _, _) do
+    raise ArgumentError, message: "nested transactions are not supported"
+  end
+
+  def transaction(server, fun, opts) do
+    protected_gen_call(server, {:transaction, fun, opts}, Config.call_timeout(opts))
+    |> case do
+      {:ok, value} -> value
+      {:error, _} = err -> err
+      {:rescued, error, trace} -> reraise(error, trace)
+      {:throw, t} -> throw(t)
+      {:exit, reason} -> exit(reason)
+    end
+  end
+
+  defp protected_gen_call(server, request, timeout) do
+    case Process.get(@trans_flag) do
+      nil -> GenServer.call(server, request, timeout)
+      _ -> {:error, :bad_context}
+    end
+  end
+
+  defp raise_error(:ok) do
+    :ok
+  end
+
+  defp raise_error({:ok, data}) do
+    data
+  end
+
+  defp raise_error({:error, {:sqlite_error, charlist}}) do
+    raise to_string(charlist)
+  end
+
+  defp raise_error({:error, :bad_context}) do
+    raise "invalid context when calling #{__MODULE__} functions."
   end
 
   # -- GenServer implementation -----------------------------------------------
@@ -103,36 +165,43 @@ defmodule Sqlitex.ServerAlt do
     end
   end
 
+  def handle_call({:transaction, fun, opts}, _from, state) do
+    %State{db: db, config: config, stmap: stmap} = state
+    trans = %Transaction{db: db, config: Keyword.merge(config, opts), stmap: stmap}
+    reply = run_transaction(trans, fun, opts)
+    {:reply, reply, state}
+  end
+
   ## -- SQLite operations ----------------------------------------------------
 
-  @spec call(server, command, options) :: {:ok, any} | {:error, any}
+  @spec call(context, command, options) :: :ok | {:ok, any} | {:error, any}
 
-  defp call(%_{config: config} = context, command, opts)
-       when is_struct(context, Transaction)
-       when is_struct(context, State) do
+  defp call(%_{config: config} = local, command, opts)
+       when is_struct(local, Transaction)
+       when is_struct(local, State) do
     opts = Keyword.merge(config, opts)
-    handle_command(command, opts, context)
+    handle_command(command, opts, local)
   end
 
   defp call(server, command, opts) do
-    GenServer.call(server, {:call_command, command, opts}, Config.call_timeout(opts))
+    protected_gen_call(server, {:call_command, command, opts}, Config.call_timeout(opts))
   end
 
-  @spec handle_command(command, options, context) :: {:ok, any} | {:error, any}
-  defp handle_command(command, options, context)
+  @spec handle_command(command, options, local) :: {:ok, any} | {:error, any}
+  defp handle_command(command, options, local)
 
-  defp handle_command({:exec, sql}, opts, context) when is_binary(sql) do
-    Sqlitex.exec(context.db, sql, opts)
+  defp handle_command({:exec, sql}, opts, local) when is_binary(sql) do
+    Sqlitex.exec(local.db, sql, opts)
   end
 
-  defp handle_command({:query, query, bindings}, opts, context) do
-    with {:ok, stmt} <- get_statement(context, query, opts),
+  defp handle_command({:query, query, bindings}, opts, local) do
+    with {:ok, stmt} <- get_statement(local, query, opts),
          {:ok, stmt} <- Statement.bind_values(stmt, bindings, opts),
          do: Statement.fetch_all(stmt, opts)
   end
 
-  defp handle_command({:query_rows, query, bindings}, opts, context) do
-    with {:ok, stmt} <- get_statement(context, query, opts),
+  defp handle_command({:query_rows, query, bindings}, opts, local) do
+    with {:ok, stmt} <- get_statement(local, query, opts),
          {:ok, stmt} <- Statement.bind_values(stmt, bindings, opts),
          {:ok, rows} <- Statement.fetch_all(stmt, Keyword.put(opts, :into, :raw_list)),
          do: {:ok, %{rows: rows, columns: stmt.column_names, types: stmt.column_types}}
@@ -142,8 +211,8 @@ defmodule Sqlitex.ServerAlt do
     {:error, {:unknown_command, command}}
   end
 
-  @spec get_statement(context, query, list()) :: {:ok, %Statement{}} | {:error, any}
-  defp get_statement(context, query, opts)
+  @spec get_statement(local, query, list()) :: {:ok, %Statement{}} | {:error, any}
+  defp get_statement(local, query, opts)
 
   defp get_statement(%{stmap: map}, key, _opts) when is_map_key(map, key) do
     Map.fetch(map, key)
@@ -151,5 +220,29 @@ defmodule Sqlitex.ServerAlt do
 
   defp get_statement(%{db: db}, sql, opts) when is_binary(sql) do
     Statement.prepare(db, sql, opts)
+  end
+
+  defp run_transaction(trans, fun, opts) do
+    with :ok <- exec(trans, "begin", opts),
+         {:ok, result} <- call_trans_fun(trans, fun),
+         :ok <- exec(trans, "commit", opts) do
+      {:ok, result}
+    else
+      err ->
+        :ok = exec(trans, "rollback", opts)
+        err
+    end
+  end
+
+  defp call_trans_fun(trans, fun) do
+    Process.put(@trans_flag, true)
+    {:ok, fun.(trans)}
+  rescue
+    error -> {:rescued, error, __STACKTRACE__}
+  catch
+    :throw, t -> {:throw, t}
+    :exit, reason -> {:exit, reason}
+  after
+    Process.delete(@trans_flag)
   end
 end
