@@ -49,7 +49,8 @@ defmodule Sqlitex.ServerAlt do
   def start_link(db_path, opts) do
     config = [
       db_timeout: Config.db_timeout(opts),
-      db_chunk_size: Config.db_chunk_size(opts)
+      db_chunk_size: Config.db_chunk_size(opts),
+      into: Keyword.get(opts, :into, [])
     ]
 
     GenServer.start_link(__MODULE__, {db_path, config}, opts)

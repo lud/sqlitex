@@ -137,11 +137,33 @@ defmodule Sqlitex.ServerAltTest do
         Server.transaction(trans, "select * from foo")
         flunk("nested transaction was accepted")
       rescue
-        e in ArgumentError -> assert true
+        _ in ArgumentError -> assert true
       end
     end)
 
     # After the transaction, the process flag is cleaned up
     assert {:ok, _} = Server.query(server, "select * from foo")
+  end
+
+  test "default config for into" do
+    # difference between servers is just the :into config
+    {:ok, server1} = Server.start_link(:memory)
+    {:ok, server2} = Server.start_link(:memory, into: %{})
+
+    migrate = fn db ->
+      Server.exec!(db, "create table foo (id integer)")
+      Server.exec!(db, "insert into foo (id) values (42)")
+    end
+
+    migrate.(server1)
+    migrate.(server2)
+
+    # server 1 will have classic rows but overriding :into still works
+    assert {:ok, [[{:id, 42}]]} === Server.query(server1, "select * from foo")
+    assert {:ok, [%{id: 42}]} === Server.query(server1, "select * from foo", into: %{})
+
+    # server 2 will default to maps but overriding with a list works too
+    assert {:ok, [%{id: 42}]} === Server.query(server2, "select * from foo")
+    assert {:ok, [[{:id, 42}]]} === Server.query(server2, "select * from foo", into: [])
   end
 end
